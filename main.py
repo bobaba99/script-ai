@@ -1,64 +1,31 @@
 import faiss
 import os
-import torch
 from dotenv import load_dotenv
 import numpy as np
-from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 import json
 
 # TOKENIZERS_PARALLELISM=false # To suppress tokenizer parallelism warning in .env
 load_dotenv()
 
-if torch.backends.mps.is_available():
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
-
 # Model names
-ST_MODEL_NAME = "all-MiniLM-L6-v2"
 OPENAI_MODEL_NAME = "text-embedding-ada-002"
 
 EMBEDDER = "openai"  # minilm or openai
 
 # Load system prompt from external file
-with open('prompts/system_prompt.md', 'r', encoding='utf-8') as f:
-    system_prompt = f.read().strip()
+with open('prompts/developer_prompt.md', 'r', encoding='utf-8') as f:
+    developer_prompt = f.read().strip()
 
 # Load user prompt template from external file
 with open('prompts/user_prompt.md', 'r', encoding='utf-8') as f:
     user_prompt_template = f.read().strip()
     
-# Example meme dataset
-# dataset = [
-#     {
-#         "meme_name": "Rickroll",
-#         "definition": "A bait-and-switch prank involving Rick Astley's 'Never Gonna Give You Up'.",
-#         "usages": [
-#             {"text": "Add this clip after any sound with a smiliar drumroll.", "funny_rating": 3},
-#             {"text": "A video with the cover art of an onlyfans model but after playing the video it's Rickroll.", "funny_rating": 5}
-#         ]
-#     }
-# ]
 
 # -------------------------
 # Embedding functions
 # -------------------------
-model_st = SentenceTransformer(ST_MODEL_NAME, device=str(device))  # small & fast embedding model
 model_openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-def embed_minilm(texts):
-    """
-    Embed a list of texts using all-MiniLM-L6-v2.
-    Returns a numpy array of shape (len(texts), 384).
-    """
-    vecs = model_st.encode(
-        texts,
-        convert_to_numpy=True,
-        normalize_embeddings=True
-    )
-    # ensure float32 and contiguous for FAISS
-    return np.ascontiguousarray(vecs.astype(np.float32))
 
 def embed_openai(texts):
     """
@@ -75,9 +42,6 @@ def embed_openai(texts):
     norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
     vecs = vecs / norms
     return np.ascontiguousarray(vecs)
-
-def get_embedder(name: str):
-    return embed_openai if name == "openai" else embed_minilm
 
 # -------------------------
 # 1. Structured Chunking
@@ -145,9 +109,8 @@ def chunking(json_obj):
 # -------------------------
 # 2. Embeddings + FAISS Index
 # -------------------------
-def build_index(texts: list[str], embedder_name: str = "minilm"):
-    embed_fn = get_embedder(embedder_name)
-    embs = embed_fn(texts)
+def build_index(texts: list[str]):
+    embs = embed_openai(texts)
     d = embs.shape[1]
     index = faiss.IndexFlatIP(d)
     try:
@@ -156,14 +119,14 @@ def build_index(texts: list[str], embedder_name: str = "minilm"):
         print(f"Error adding embeddings to index: {e}")
         print(f"Embeddings shape: {embs.shape}, dtype: {embs.dtype}")
         raise
-    return index, embed_fn, embs
+    return index, embs
 
 with open('knowledge_base_chunk.json', 'r', encoding='utf-8') as f:
     all_chunks = json.load(f)
 
 
 texts = [chunk["content"] for chunk in all_chunks]
-index, embed_fn, embeddings = build_index(texts, EMBEDDER)
+index, embeddings = build_index(texts)
 
 
 # -------------------------
@@ -209,7 +172,7 @@ def retrieve(query: str, top_k: int = 3, **filters):
         # Extract special parameters
         funny_sort = filters.pop('funny_sort', False)
         
-        q = embed_fn([query])
+        q = embed_openai([query])
         search_k = min(top_k * 7, index.ntotal)  # Don't search for more than available
         D, I = index.search(q, search_k)  # type: ignore
         results = []
@@ -271,17 +234,80 @@ def chat_completion(user_query: str, context: list[dict]):
     response = model_openai.chat.completions.create(
         model="gpt-5-mini",
         messages=[
-            {"role": "system", "content": system_prompt},
+            {"role": "developer", "content": developer_prompt},
             {"role": "user", "content": user_message}
         ]
     )
     return response.choices[0].message.content
 
-user_query = "用知识库里的'顶级过肺'，写一个场景在健身房，关于鞋臭的段子。"
-# user_query = "顶级过肺"
-context = retrieve(user_query, top_k=3)
-print(f"Context: {context}")
-response = chat_completion(user_query, context)
-print("#" * 80)
-print(f"Response: {response}")
-print("#" * 80)
+def generate_json_output(query_list, top_k=3):
+    """
+    Take a JSON list of objects and output JSON structure for each
+    
+    Args:
+        query_list (list): List of dicts with "query" and "required_meme" keys
+                          [{"query": "", "required_meme": ""}, ...]
+        top_k (int): Number of chunks to retrieve
+    
+    Returns:
+        list: List of JSON structures with query, required_meme, top_k, and output
+    """
+    if not query_list:
+        raise ValueError("List cannot be empty")
+    
+    results = []
+    
+    for item in query_list:
+        if not isinstance(item, dict) or "query" not in item or "required_meme" not in item:
+            print(f"Invalid item format: {item}. Expected dict with 'query' and 'required_meme' keys")
+            continue
+            
+        query = item["query"]
+        meme = item["required_meme"]
+        
+        try:
+            # Retrieve relevant chunks
+            context = retrieve(query, top_k=top_k)
+            
+            # Generate model output
+            output = chat_completion(query, context)
+            
+            # Create JSON structure
+            result = {
+                "query": query,
+                "required_meme": meme,
+                "top_k": top_k,
+                "output": output
+            }
+            
+            results.append(result)
+            print(f"Query: {query}")
+            
+        except Exception as e:
+            print(f"Error generating output for query '{query}': {e}")
+            continue
+    
+    return results
+
+# user_query = "场景在健身房，用知识库里的'邪修'，写一个关于博主艾尔加朵的段子。"
+# context = retrieve(user_query, top_k=3)
+# # print(f"Context: {context}")
+# response = chat_completion(user_query, context)
+# print("#" * 80)
+# print(f"{response}")
+# print("#" * 80)
+
+query_list = [
+    {"query": "场景在健身房，用知识库里的'邪修'，写一个关于博主艾尔加朵的段子。", "required_meme": "邪修"},
+    {"query": "场景在健身房，用知识库里的'丝瓜汤'，写一个关于博主艾尔加朵的段子。", "required_meme": "丝瓜汤"},
+    {"query": "场景在健身房，用知识库里的'美美桑内'，写一个关于博主艾尔加朵的段子。", "required_meme": "美美桑内"},
+    {"query": "场景在健身房，用知识库里的'顶级过肺'，写一个关于博主艾尔加朵的段子。", "required_meme": "顶级过肺"},
+    {"query": "场景在健身房，用知识库里的'县城婆罗门'，写一个关于博主艾尔加朵的段子。", "required_meme": "县城婆罗门"},
+    {"query": "场景在健身房，用知识库里的'被做局了'，写一个关于博主艾尔加朵的段子。", "required_meme": "被做局了"},
+    {"query": "场景在健身房，用知识库里的'癫公癫婆'，写一个关于博主艾尔加朵的段子。", "required_meme": "癫公癫婆"},
+    {"query": "场景在健身房，用知识库里的'姐姐杀我'，写一个关于博主艾尔加朵的段子。", "required_meme": "姐姐杀我"},
+]
+eval_result = generate_json_output(query_list, top_k=3)
+
+with open('samples.json', 'w', encoding='utf-8') as f:
+    json.dump(eval_result, f, ensure_ascii=False, indent=2)

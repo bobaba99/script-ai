@@ -1,0 +1,5 @@
+evals:
+  - id: meme-eval
+    class: meme_eval:MemeEval
+    args: {}
+    samples_jsonl: evals/samples.jsonl
