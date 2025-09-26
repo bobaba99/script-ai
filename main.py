@@ -1,0 +1,287 @@
+import faiss
+import os
+import torch
+from dotenv import load_dotenv
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from openai import OpenAI
+import json
+
+# TOKENIZERS_PARALLELISM=false # To suppress tokenizer parallelism warning in .env
+load_dotenv()
+
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+
+# Model names
+ST_MODEL_NAME = "all-MiniLM-L6-v2"
+OPENAI_MODEL_NAME = "text-embedding-ada-002"
+
+EMBEDDER = "openai"  # minilm or openai
+
+# Load system prompt from external file
+with open('prompts/system_prompt.md', 'r', encoding='utf-8') as f:
+    system_prompt = f.read().strip()
+
+# Load user prompt template from external file
+with open('prompts/user_prompt.md', 'r', encoding='utf-8') as f:
+    user_prompt_template = f.read().strip()
+    
+# Example meme dataset
+# dataset = [
+#     {
+#         "meme_name": "Rickroll",
+#         "definition": "A bait-and-switch prank involving Rick Astley's 'Never Gonna Give You Up'.",
+#         "usages": [
+#             {"text": "Add this clip after any sound with a smiliar drumroll.", "funny_rating": 3},
+#             {"text": "A video with the cover art of an onlyfans model but after playing the video it's Rickroll.", "funny_rating": 5}
+#         ]
+#     }
+# ]
+
+# -------------------------
+# Embedding functions
+# -------------------------
+model_st = SentenceTransformer(ST_MODEL_NAME, device=str(device))  # small & fast embedding model
+model_openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+def embed_minilm(texts):
+    """
+    Embed a list of texts using all-MiniLM-L6-v2.
+    Returns a numpy array of shape (len(texts), 384).
+    """
+    vecs = model_st.encode(
+        texts,
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    )
+    # ensure float32 and contiguous for FAISS
+    return np.ascontiguousarray(vecs.astype(np.float32))
+
+def embed_openai(texts):
+    """
+    Embed a list of texts using OpenAI ada v2.
+    Returns a numpy array of shape (len(texts), 1536).
+    """
+    response = model_openai.embeddings.create(
+        input=texts,
+        model=OPENAI_MODEL_NAME,
+        encoding_format="float"
+    )
+    vecs = np.array([item.embedding for item in response.data], dtype=np.float32)
+    # L2-normalise for cosine via inner product
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
+    vecs = vecs / norms
+    return np.ascontiguousarray(vecs)
+
+def get_embedder(name: str):
+    return embed_openai if name == "openai" else embed_minilm
+
+# -------------------------
+# 1. Structured Chunking
+# -------------------------
+def chunking(json_obj):
+    """
+    Chunk a meme JSON object into smaller pieces with metadata.
+    Each chunk is a dict with keys:
+    id, meme_name, type (definition/usage), funny_rating, content, tags, class.
+    """
+    name = json_obj["meme_name"]
+    
+    # Skip entries with empty meme_name
+    if not name.strip():
+        return []
+    
+    chunks = [{
+        "id": f"{name}_definition",
+        "meme_name": name,
+        "type": "definition", 
+        "update_time": json_obj.get("update_time", ""),
+        "tags": json_obj.get("tags", []),
+        "funny_rating": None,
+        "class": json_obj.get("class", []),
+        "phrase": None,
+        "content": f"{name}: {json_obj['definition']}"
+    }]
+    
+    for i, usage in enumerate(json_obj["usages"]):
+        # Skip usages with empty phrases or negative funny_rating
+        if not usage.get("phrase") or usage.get("funny_rating", 0) < 0:
+            continue
+            
+        chunks.append({
+            "id": f"{name}_usage_{i}",
+            "meme_name": name,
+            "type": "usage",
+            "update_time": json_obj.get("update_time", ""),
+            "tags": json_obj.get("tags", []),
+            "funny_rating": usage["funny_rating"],
+            "phrase": usage["phrase"],
+            "class": usage["class"],
+            "content": f"{name} (usage, {usage['class']}): {usage['phrase']}"
+        })
+    
+    return chunks
+
+# -------------------------
+# Load and chunk dataset, one time
+# Load dataset from knowledge_base.json
+# with open('raw_memes.json', 'r', encoding='utf-8') as f:
+#     dataset = json.load(f)
+
+# # Ensure dataset is a list
+# if not isinstance(dataset, list):
+#     dataset = [dataset]
+
+# all_chunks = [chunk for meme in dataset for chunk in chunking(meme)]
+
+# # Save chunked data to knowledge_base_chunk.json
+# with open('knowledge_base_chunk.json', 'w', encoding='utf-8') as f:
+#     json.dump(all_chunks, f, ensure_ascii=False, indent=2)
+# -------------------------
+
+# -------------------------
+# 2. Embeddings + FAISS Index
+# -------------------------
+def build_index(texts: list[str], embedder_name: str = "minilm"):
+    embed_fn = get_embedder(embedder_name)
+    embs = embed_fn(texts)
+    d = embs.shape[1]
+    index = faiss.IndexFlatIP(d)
+    try:
+        index.add(embs) # type: ignore
+    except Exception as e:
+        print(f"Error adding embeddings to index: {e}")
+        print(f"Embeddings shape: {embs.shape}, dtype: {embs.dtype}")
+        raise
+    return index, embed_fn, embs
+
+with open('knowledge_base_chunk.json', 'r', encoding='utf-8') as f:
+    all_chunks = json.load(f)
+
+
+texts = [chunk["content"] for chunk in all_chunks]
+index, embed_fn, embeddings = build_index(texts, EMBEDDER)
+
+
+# -------------------------
+# 3. Hybrid Retrieval
+# -------------------------
+def retrieve(query: str, top_k: int = 3, **filters):
+    """
+    Retrieve top_k relevant chunks for the query with flexible metadata filtering.
+    
+    Args:
+        query: Search query string
+        top_k: Number of results to return
+        **filters: Flexible metadata filters using keyword arguments:
+            - type: Filter by type ("definition" or "usage")  
+            - meme_name: Filter by meme name(s) - string or list
+            - funny_rating: Filter by minimum funny rating
+            - date: Filter by specific date
+            - funny_sort: Sort by funny_rating (True/False, default False)
+    
+    Returns:
+        List of dicts containing content, metadata, and similarity scores
+    
+    Example usage:
+        # Basic search
+        retrieve("funny meme")
+        
+        # Search only definitions
+        retrieve("what is rickroll", type="definition")
+        
+        # Search specific memes with usage examples
+        retrieve("funny usage", meme_name="Rickroll", type="usage")
+        
+        # Search multiple memes, sorted by funny rating
+        retrieve("humor", meme_name=["Rickroll", "Doge"], funny_sort=True)
+        
+        # High-quality content only
+        retrieve("best memes", funny_rating=4, funny_sort=True)
+        
+        # Search with date filter
+        retrieve("recent memes", date="2025-01-15", top_k=5)
+    """
+    try:
+        # Extract special parameters
+        funny_sort = filters.pop('funny_sort', False)
+        
+        q = embed_fn([query])
+        search_k = min(top_k * 7, index.ntotal)  # Don't search for more than available
+        D, I = index.search(q, search_k)  # type: ignore
+        results = []
+        
+        for score, idx in zip(D[0], I[0]):
+            if idx == -1 or idx >= len(all_chunks):
+                continue
+            item = all_chunks[idx].copy()
+            item["score"] = float(score)
+            results.append(item)
+
+        # Flexible metadata filtering
+        for key, value in filters.items():
+            if isinstance(value, list):
+                # Handle list values (e.g., meme_name=["Rickroll", "Doge"])
+                results = [r for r in results if r.get(key) in value]
+            elif key == "funny_rating" and isinstance(value, (int, float)):
+                # Handle minimum funny rating filter
+                results = [r for r in results if (r.get(key) or 0) >= value]
+            else:
+                # Handle exact match
+                results = [r for r in results if r.get(key) == value]
+
+        # Optional rerank by funny rating
+        if funny_sort:
+            results.sort(key=lambda x: (x.get("funny_rating") or 0), reverse=True)
+
+        return results[:top_k]
+    except Exception as e: 
+        print(f"Error in retrieve function: {e}")
+        return []
+
+# -------------------------
+# 4. Chat Completion
+# -------------------------
+
+def chat_completion(user_query: str, context: list[dict]):
+    # Format retrieved chunks for the template
+    formatted_chunks = []
+    for chunk in context:
+        chunk_info = f"meme_name: {chunk['meme_name']}\n"
+        chunk_info += f"definition: {chunk.get('content', '')}\n"
+        if chunk.get('phrase'):
+            chunk_info += f"phrase: {chunk['phrase']}\n"
+        if chunk.get('class'):
+            chunk_info += f"class: {chunk['class']}\n"
+        if chunk.get('funny_rating') is not None:
+            chunk_info += f"funny_rating: {chunk['funny_rating']}\n"
+        formatted_chunks.append(chunk_info)
+    
+    retrieved_chunks_text = "\n---\n".join(formatted_chunks)
+    
+    # Fill in the template
+    user_message = user_prompt_template.format(
+        retrieved_chunks_here=retrieved_chunks_text,
+        user_query=user_query
+    )
+    
+    response = model_openai.chat.completions.create(
+        model="gpt-5-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ]
+    )
+    return response.choices[0].message.content
+
+user_query = "用知识库里的'顶级过肺'，写一个场景在健身房，关于鞋臭的段子。"
+# user_query = "顶级过肺"
+context = retrieve(user_query, top_k=3)
+print(f"Context: {context}")
+response = chat_completion(user_query, context)
+print("#" * 80)
+print(f"Response: {response}")
+print("#" * 80)
