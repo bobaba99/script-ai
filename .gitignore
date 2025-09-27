@@ -9,11 +9,16 @@ scrap-gengbaike.py
 # Data files (local only)
 # ----------------------
 metrics.csv
+samples.json
 knowledge_base.json
 knowledge_base_chunk.json
 raw_memes.json
 outputs/
 view-source_gengbaike-2555.html
+audio/
+transcription/*.json
+transcription/*.jsonl
+transcription/*.txt
 
 # ----------------------
 # macOS system files
@@ -34,7 +39,6 @@ __pycache__/
 *.ipynb_checkpoints
 
 # Virtual environments
-venv/
 .env/
 .venv/
 env/
