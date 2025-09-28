@@ -9,16 +9,11 @@ scrap-gengbaike.py
 # Data files (local only)
 # ----------------------
 metrics.csv
-samples.json
-knowledge_base.json
-knowledge_base_chunk.json
-raw_memes.json
+knowledge_base/
 outputs/
+transcription/
 view-source_gengbaike-2555.html
 audio/
-transcription/*.json
-transcription/*.jsonl
-transcription/*.txt
 
 # ----------------------
 # macOS system files

@@ -92,7 +92,7 @@ def chunking(json_obj):
 # -------------------------
 # Load and chunk dataset, one time
 # Load dataset from knowledge_base.json
-# with open('raw_memes.json', 'r', encoding='utf-8') as f:
+# with open('/knowledge_base/raw_memes.json', 'r', encoding='utf-8') as f:
 #     dataset = json.load(f)
 
 # # Ensure dataset is a list
@@ -102,7 +102,7 @@ def chunking(json_obj):
 # all_chunks = [chunk for meme in dataset for chunk in chunking(meme)]
 
 # # Save chunked data to knowledge_base_chunk.json
-# with open('knowledge_base_chunk.json', 'w', encoding='utf-8') as f:
+# with open('/knowledge_base/knowledge_base_chunk.json', 'w', encoding='utf-8') as f:
 #     json.dump(all_chunks, f, ensure_ascii=False, indent=2)
 # -------------------------
 
@@ -121,7 +121,7 @@ def build_index(texts: list[str]):
         raise
     return index, embs
 
-with open('knowledge_base_chunk.json', 'r', encoding='utf-8') as f:
+with open('/knowledge_base/knowledge_base_chunk.json', 'r', encoding='utf-8') as f:
     all_chunks = json.load(f)
 
 
