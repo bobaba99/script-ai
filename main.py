@@ -4,14 +4,16 @@ from dotenv import load_dotenv
 import numpy as np
 from openai import OpenAI
 import json
+from volcenginesdkarkruntime import Ark
 
 # TOKENIZERS_PARALLELISM=false # To suppress tokenizer parallelism warning in .env
 load_dotenv()
 
 # Model names
 OPENAI_MODEL_NAME = "text-embedding-ada-002"
-
-EMBEDDER = "openai"  # minilm or openai
+OPENAI_CHAT_MODEL = "ft:gpt-4.1-2025-04-14:personal::CKgaEPPq"  # ft:gpt-4.1-2025-04-14:personal::CKgaEPPq
+ARK_CHAT_MODEL = "ep-20251001101741-9cx8r" # manual set up in Ark dashboard 在线推理-自定义推理接入点-创建推理接入点-模型仓库
+MODEL_SELECTED = "ark"
 
 # Load system prompt from external file
 with open('prompts/developer_prompt.md', 'r', encoding='utf-8') as f:
@@ -26,6 +28,8 @@ with open('prompts/user_prompt.md', 'r', encoding='utf-8') as f:
 # Embedding functions
 # -------------------------
 model_openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# model_ark = Ark(api_key=os.getenv("ARK_API_KEY"), base_url="https://ark.cn-beijing.volces.com/api/v3")
+model_ark = OpenAI(base_url="https://ark.cn-beijing.volces.com/api/v3", api_key=os.environ.get("ARK_API_KEY"))
 
 def embed_openai(texts):
     """
@@ -121,7 +125,7 @@ def build_index(texts: list[str]):
         raise
     return index, embs
 
-with open('/knowledge_base/knowledge_base_chunk.json', 'r', encoding='utf-8') as f:
+with open('knowledge_base/knowledge_base_chunk.json', 'r', encoding='utf-8') as f:
     all_chunks = json.load(f)
 
 
@@ -209,7 +213,7 @@ def retrieve(query: str, top_k: int = 3, **filters):
 # 4. Chat Completion
 # -------------------------
 
-def chat_completion(user_query: str, context: list[dict]):
+def chat_completion(user_query: str, context: list[dict], model="openai"):
     # Format retrieved chunks for the template
     formatted_chunks = []
     for chunk in context:
@@ -231,14 +235,26 @@ def chat_completion(user_query: str, context: list[dict]):
         user_query=user_query
     )
     
-    response = model_openai.chat.completions.create(
-        model="gpt-5-mini",
-        messages=[
-            {"role": "developer", "content": developer_prompt},
-            {"role": "user", "content": user_message}
-        ]
-    )
-    return response.choices[0].message.content
+    if model == "openai":
+        response = model_openai.chat.completions.create(
+            model=OPENAI_CHAT_MODEL,
+            messages=[
+                {"role": "developer", "content": developer_prompt},
+                {"role": "user", "content": user_message}
+            ]
+        )
+    elif model == "ark":
+        response = model_ark.chat.completions.create(
+            model=ARK_CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": developer_prompt},
+                {"role": "user", "content": user_message}
+            ]
+        )
+    else:
+        raise ValueError(f"Unsupported model: {model}")
+
+    return response.choices[0].message.content # type: ignore
 
 def generate_json_output(query_list, top_k=3):
     """
@@ -270,7 +286,7 @@ def generate_json_output(query_list, top_k=3):
             context = retrieve(query, top_k=top_k)
             
             # Generate model output
-            output = chat_completion(query, context)
+            output = chat_completion(query, context, model=MODEL_SELECTED)
             
             # Create JSON structure
             result = {
@@ -288,14 +304,6 @@ def generate_json_output(query_list, top_k=3):
             continue
     
     return results
-
-# user_query = "场景在健身房，用知识库里的'邪修'，写一个关于博主艾尔加朵的段子。"
-# context = retrieve(user_query, top_k=3)
-# # print(f"Context: {context}")
-# response = chat_completion(user_query, context)
-# print("#" * 80)
-# print(f"{response}")
-# print("#" * 80)
 
 query_list = [
     {"query": "场景在健身房，用知识库里的'邪修'，写一个关于博主艾尔加朵的段子。", "required_meme": "邪修"},
